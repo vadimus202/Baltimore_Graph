@@ -1,0 +1,283 @@
+---
+title: "Network Visualization and Analysis"
+subtitle: "Using R to Cluster City of Baltimore Agencies<BR>"
+author: "Vadim Bondarenko, FI Consulting<BR>bondarenko@ficonsulting.com"
+date: "November 1, 2015"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: yes
+---
+
+
+# Introduction
+
+This weekend I finally got around learning about network visualization and analysis. In this post I provide step-by-step instructions on how to use R's _igraph_ package to turn transaction data into a network graph and extract some actionable insight. 
+
+Since this is my first foray into this area, the code below is aimed to help the beginners like me take their first steps in network analysis. I realize there are probably better tools and methods for achieving the same results, so your feedback with corrections and/or suggestions would be appreciated.
+
+
+# Background and Motivation
+
+The basic idea came to me from this [post](http://www.alvarezandmarsal.com/data-analytics-and-infographics-used-detecting-illicit-behavior) on using network analysis to detect fraud and other types of illicit behavior. 
+
+The authors describe a False Claims Act case regarding the quantification and identification of fraudulent medical claims. The case involved over 140,000 medical claims where a sample of 2,500 claims was selected and reviewed for suspicious activities. Of these 2,500 medical claims, 161 were identified as being false claims. The traditional types of unsupervised analyses, such as correlations, tabulations, and charts produced little or no results. Even the more sophisticated supervised predictive models, such as logistic regression, produced poor results and had little ability to identify the fraudulent claims.
+
+When doctors treat the same patient, it is very likely they would have interactions with one another and thus know each other. This information then allowed us to create a network graph of doctors, detailing the relationships and the extent of interactions that the doctors had with one another and, more importantly, how these interactions were related to the fraudulent claims. Below is a representative example of the network of doctors, where the doctors associated with patients with fraudulent claims have been marked as a red node.
+
+![Doctor Network defined by common patients](http://www.alvarezandmarsal.com/sites/default/files/M-Salve%20Overall%20Network.jpg)
+
+By creating a doctor network from the actual claims data, patterns associated with the fraud begin to emerge to which the more traditional methods are blind. One of the obvious features of this doctor network is homophily; that is, doctors who are associated with fraudulent claims are more likely to be connected to other doctors who are also associated with fraudulent claims. In other words, “fraud begets fraud.” In fact, of the 18 doctors who were associated with fraudulent claims only 2 were not connected with another doctor who was also associated with fraudulent claims. Stated another way, 16 of the 18 doctors who were associated with a fraudulent claim were connected with at least one other doctor who was also associated with a fraudulent claim.
+
+In addition, this [Introduction to Network Mathematics](http://webmathematics.net/) by __Bruce Hoppe__ is an excellent primer on the theoretical concepts behind network graphs.
+
+
+# The Data
+
+I wanted to learn how to build a graph analogous to the network of doctors connected by common patients as shown above. I used the City of Baltimore Contracts data available from this [portal](https://data.baltimorecity.gov/Financial/Baltimore-City-Contracts-Bureau-of-Purchases-Depar/e7gh-hui5), which I downloaded into a CSV file. My goal was not to uncover fraud, but to be able to visualize a network of City Agencies connected by their common Vendors. 
+
+After some research and going over the [documentation](http://igraph.org/r/) for the _igraph_ package, I came up with the following R program.
+
+
+# Formating the Graph Data
+
+## Loading Raw Data and R Packages 
+
+```{r setup, tidy=FALSE, warning=FALSE, message=FALSE}
+# load required packages
+library(igraph)
+library(tidyr)
+library(dplyr)
+library(RColorBrewer)
+library(DT)
+library(knitr)
+
+# load raw data from csv
+bmore.raw <- 
+    read.csv("Baltimore_City_Contracts_-__Bureau_of_Purchases__Department_of_Finance.csv", 
+             stringsAsFactors=FALSE)
+
+# sample of raw data
+bmore.raw %>% head(5) %>% kable
+
+```
+
+For every contract, the dataset provides the following information:
+
+- Contracting Agency
+- Vendor name and ID
+- Contract description
+- Begin and end dates
+- Contract amounts
+
+For the purposes of network analysis, we're primarily interested in the connections between City agencies and their vendors.
+
+
+## Defining Network Nodes
+
+Before jumping into building a network graph, I wanted to examine its nodes, aka _verices_. In our case the graph will have two distinct types of vertices: __Agencies__ and __Vendors__. 
+
+### City Agencies
+
+I begin by aggregating the data by City Agency and calculating the total number of vendor connections, number of contracts, and and contract amounts.
+
+```{r}
+agency <- 
+    bmore.raw %>% 
+    # aggregate by agency
+    group_by(agency) %>% 
+    summarise(vendor_count = length(unique(vendorID)),
+              contr_count = n(),
+              contr_amt = as.integer(sum(extract_numeric(totalContractAmt))/1000)) %>% 
+    # sort by number of vendors
+    arrange(-vendor_count)
+
+agency %>% datatable
+
+```
+
+The Agency summary table shows that the number Vendor connections varies from `r min(agency$vendor_count)` to `r max(agency$vendor_count)`.
+
+### Contract Vendors
+
+Similarly, I aggregate the data by Vendor and calculate the total number of Agency connections, number of contracts, and and contract amounts.
+
+```{r}
+
+vendor <- 
+    bmore.raw %>% 
+    # aggregate by agency
+    group_by(vendorName) %>% 
+    summarise(agency_count = length(unique(agency)),
+              contr_count = n(),
+              contr_amt = as.integer(sum(extract_numeric(totalContractAmt))/1000)) %>% 
+    # sort by number of vendors
+    arrange(-agency_count)
+
+vendor %>% head(20) %>% datatable
+
+```
+
+The Vendor summary table reveals that the number Agency connections per Vendor is much lower with a maximum number of Agencies contracting one vendor = `r max(vendor$agency_count)`.
+
+
+
+## Defining Network Connections
+
+Next, I define a list of network connections between the Agencies and their Vendors. To avoid multiple connections between the same Agency-Vendor pairs, I collapse the data by each unique pair and sum their contract amounts.
+
+```{r}
+conn <- 
+    bmore.raw %>% 
+    select(agency, 
+           vendor = vendorName, 
+           amt = totalContractAmt) %>% 
+    group_by(agency, vendor) %>% 
+    summarise(n = n(), amt = as.integer(sum(extract_numeric(amt))/1000)) %>% 
+    ungroup
+
+conn %>% head(100) %>% datatable
+
+
+```
+
+
+# Building the Network Graph
+
+## Unformated Graph
+
+Finally, I'm ready to build my first network graph from the data. Note that the connection between an Agency and a Vendor is always one-way, I use the option _directed = TRUE_. 
+
+```{r, fig.height=6, fig.height=6, fig.align = 'center'}
+set.seed(551)
+
+# define network graph from data frame
+g <- graph_from_data_frame(conn, directed = TRUE)
+
+# list of graph vertices (nodes)
+V(g)
+
+# list of graph edges (connections)
+E(g)
+
+# plot the graph
+par(mai=c(0,0,1,0))
+plot(g)
+
+```
+
+## Adjusting Graph Formatting
+
+Not surprisingly, given so many graph vertices (`r length(V(g))`), my initial graph is a mess. There are too many labels and each one of the nodes is of the same size.
+
+To make the graph more readable, I tried to differentiate between Agencies and Vendors. Since there are much fewer Agencies (`r nrow(agency)`) than Vendors (`r nrow(vendor)`), I only label the Agencies and suppress Vendor labels. I also assign them different colors. 
+
+In addition, I adjust the size of of each Agency node by the number of outgoing connections, so that an Agency with connections to more Vendors is larger.
+
+The full list of graph formatting options is documented [here](http://igraph.org/r/doc/plot.common.html).
+
+```{r, fig.width=9, fig.height=9, fig.align = 'center'}
+
+# index of Vendors
+is.vendor <- V(g)$name %in% conn$vendor
+
+# Vendor labels
+V(g)$label[is.vendor] <- NA
+# Agency labels
+V(g)$label[!is.vendor] <- V(g)$name[!is.vendor]
+
+# node colors
+V(g)$color <- ifelse(is.vendor, 'black', brewer.pal(3,'Pastel2')[1])
+
+# node size
+V(g)$size<-degree(g, mode = 'out')/5
+
+plot(g, 
+     vertex.label.color='darkblue', 
+     vertex.label.cex=0.75, vertex.frame.color = NA,
+     edge.arrow.size = 0, edge.arrow.width = 0)
+
+```
+
+The resulting graph is not perfect, but much more readable. The Agency nodes are sized according to their respective number of outgoing connections (degrees). The Vendor nodes are shrunk to nothing, due to their lack of any outgoing connections. we can see that the Agencies with the most connections are naturally more likely to have Vendors in common with other Agencies. These large, well-connected Agencies form an inter-connected cluster of nodes in the center of the graph. The less-connected Agencies are located along the graph's periphery.
+
+
+## Extracting Direct Links between Agencies
+
+I'm only interested in the Agency nodes and their inter-connectedness. However, the Agencies are not connected to each other directly, but rather indirectly through a network of Vendors. This is common in fraud detection scenarios, where it's difficult to connect entities that want to appear not connected.
+
+As the next step of my analysis, I would like to drop all Vendor nodes from the graph and explicitly connect those Agency nodes that share common Vendors. To achieve this goal, I was able to use the _distances()_ function from the _igraph_ package, which calculates the shortest distance (in terms of number of connections) between any given set of nodes. Below, is a partial distance matrix for Agency nodes only.  
+
+
+```{r, results='as.is'}
+# matrix of shortest distances between non-vendors
+d.mat <- distances(g, V(g)[!is.vendor], to = V(g)[!is.vendor])
+
+d.mat[1:8, 1:8] %>% datatable()
+```
+
+The diagonal of this matrix contains all zeros, because the shortest distance from a node to itself is zero. The blank matrix cells indicate that the two nodes are not connected at all, as they do not have any Vendors in common. The shortest possible distance between two Agencies is 2, because to connect to another Agency, we must go through at least one Vendor. I use the code below to extract a list of Agency-to-Agency connections where the shortest distance equals to 2, meaning both nodes are connected directly by one Vendor.
+
+```{r}
+# remove values in the lower triangle (avoid duplicates A->B is the same as b->A) 
+# and on matrix diagonal (connection to itself)
+d.mat[!upper.tri(d.mat)] <- NA
+
+# convert matrix to dataframe
+d <- 
+    d.mat %>% 
+    as.data.frame() %>% 
+    bind_cols(data_frame(agy1=row.names(.)), .) %>% 
+    # reshape table from wide to tall
+    gather(agy2, d, -agy1) %>% 
+    # keep direct connections only
+    filter(d==2)
+
+d
+```
+
+
+## Agency Network Graph
+
+We can now build another graph showing the network of Agencies with direct connections. It looks similar to the previous plot, but it's much cleaner, because we dropped all Agency connections to hundreds of different Vendors.
+
+```{r, fig.width=9, fig.height=9, fig.align = 'center'}
+g2 <- graph_from_data_frame(d, directed = F, vertices = agency)
+plot(g2)
+```
+
+
+## Clustering Network Nodes
+
+We can take this analysis a step further, by assigning the nodes with the most inter-connections into clusters and plotting them in different colors. 
+
+```{r, fig.width=9, fig.height=9, fig.align = 'center'}
+
+g2_groups <- cluster_optimal(g2)
+V(g2)$color <- brewer.pal(12, 'Set3')[membership(g2_groups)]
+plot(g2, 
+     vertex.label.color='darkblue', 
+     vertex.label.cex=0.75, vertex.frame.color = NA,
+     edge.arrow.size = 0, edge.arrow.width = 0)
+
+```
+
+
+## Arranging a Circle Network
+
+It is also possible to arrange the graph nodes into a circle with just a few lines of extra code. Of course, this layout loses the location of network centrality apparent in the previous graph.
+
+```{r, fig.width=9, fig.height=9, fig.align = 'center'}
+
+coords <- layout_in_circle(g2, order = order(membership(g2_groups)))
+plot(g2, 
+     layout = coords, 
+     vertex.label.color='darkblue', 
+     vertex.label.cex=0.75, vertex.frame.color = NA,
+     edge.arrow.size = 0, edge.arrow.width = 0)
+```
+
+# Conclusion
+
+The R code above demonstrates how it is possible to transform transaction-type data into network graph data, build a network graph, and assign graph nodes into clusters based on the level of their network proximity. These methods are widely used in uncovering hidden pattern and helping to detect improper payments, fraud waste and abuse, and other illicit activities.
